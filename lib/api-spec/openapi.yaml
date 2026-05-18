@@ -3,13 +3,17 @@ info:
   # Do not change the title, if the title changes, the import paths will be broken
   title: Api
   version: 0.1.0
-  description: API specification
+  description: Webmail API specification
 servers:
   - url: /api
     description: Base API path
 tags:
   - name: health
     description: Health operations
+  - name: mail
+    description: Mail operations
+  - name: admin
+    description: Admin operations
 paths:
   /healthz:
     get:
@@ -24,6 +28,141 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+  /inbox:
+    get:
+      operationId: getInbox
+      tags: [mail]
+      summary: Get inbox
+      description: Fetch all emails in the inbox for a given address
+      parameters:
+        - name: email
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Full email address (e.g. user@yourdomain.com)
+      responses:
+        "200":
+          description: Inbox retrieved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InboxResponse"
+        "400":
+          description: Invalid email address
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "502":
+          description: Failed to fetch from Yopmail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /email:
+    get:
+      operationId: getEmail
+      tags: [mail]
+      summary: Get email content
+      description: Fetch the full content of a specific email
+      parameters:
+        - name: email
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Full email address
+        - name: id
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Message ID
+      responses:
+        "200":
+          description: Email content
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EmailMessage"
+        "400":
+          description: Invalid parameters
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Email not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "502":
+          description: Failed to fetch from Yopmail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /admin/domains:
+    get:
+      operationId: listDomains
+      tags: [admin]
+      summary: List domains
+      description: List all configured domains
+      responses:
+        "200":
+          description: Domain list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DomainListResponse"
+    post:
+      operationId: addDomain
+      tags: [admin]
+      summary: Add domain
+      description: Add a new domain to the managed list
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DomainInput"
+      responses:
+        "201":
+          description: Domain added
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DomainItem"
+        "400":
+          description: Invalid input or duplicate domain
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /admin/domains/{id}:
+    delete:
+      operationId: deleteDomain
+      tags: [admin]
+      summary: Delete domain
+      description: Remove a domain from the managed list
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "204":
+          description: Domain deleted
+        "404":
+          description: Domain not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
 components:
   schemas:
     HealthStatus:
@@ -33,4 +172,78 @@ components:
           type: string
       required:
         - status
-
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+      required:
+        - error
+    InboxItem:
+      type: object
+      required: [id, from, subject, date, isRead]
+      properties:
+        id:
+          type: string
+        from:
+          type: string
+        subject:
+          type: string
+        date:
+          type: string
+        isRead:
+          type: boolean
+    InboxResponse:
+      type: object
+      required: [email, messages]
+      properties:
+        email:
+          type: string
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/InboxItem"
+    EmailMessage:
+      type: object
+      required: [id, from, subject, date, html]
+      properties:
+        id:
+          type: string
+        from:
+          type: string
+        subject:
+          type: string
+        date:
+          type: string
+        html:
+          type: string
+    DomainItem:
+      type: object
+      required: [id, domain, createdAt]
+      properties:
+        id:
+          type: integer
+        domain:
+          type: string
+        label:
+          type: ["string", "null"]
+        createdAt:
+          type: string
+    DomainListResponse:
+      type: object
+      required: [domains]
+      properties:
+        domains:
+          type: array
+          items:
+            $ref: "#/components/schemas/DomainItem"
+    DomainInput:
+      type: object
+      required: [domain]
+      properties:
+        domain:
+          type: string
+          description: The domain name (e.g. mail.yoursite.com)
+        label:
+          type: ["string", "null"]
+          description: Optional friendly label for the domain

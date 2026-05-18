@@ -1,0 +1,31 @@
+kind = "web"
+previewPath = "/"
+title = "Webmail Client"
+version = "1.0.0"
+id = "artifacts/webmail"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 23342
+
+[services.development]
+run = "pnpm --filter @workspace/webmail run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/webmail", "run", "build" ]
+publicDir = "artifacts/webmail/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "23342"
+BASE_PATH = "/"
