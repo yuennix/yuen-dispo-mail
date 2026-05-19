@@ -354,9 +354,13 @@ function parseEmailHtml(rawHtml: string, id: string): EmailMessage {
 }
 
 /**
- * Fetch an email using a real headless browser.
- * The persistent browser context accumulates cookies and executes JavaScript
- * challenges, making it appear as a genuine returning user to Yopmail.
+ * Fetch an email using a real headless browser by interacting with the
+ * YopMail webmail UI naturally — navigating to the webmail page, waiting
+ * for the inbox iframe to load, clicking the target email row, then
+ * extracting the content from the mail iframe.
+ *
+ * This human-like interaction pattern avoids bot detection far better than
+ * navigating directly to the /mail endpoint.
  */
 async function fetchEmailWithBrowser(
   login: string,
@@ -374,27 +378,76 @@ async function fetchEmailWithBrowser(
   try {
     logger.debug({ login, domain, id }, "Browser: navigating to webmail");
 
-    // Visit the webmail page — this executes JS, sets cookies, builds trust.
     await page.goto(wmUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
 
-    // Extract the yp token the page injected into the DOM.
+    // Wait for the inbox iframe to appear in the DOM.
+    await page.waitForSelector("#ifinbox", { timeout: 20000 }).catch(() => null);
+
+    // Give the inbox iframe time to fully load its content.
+    await page.waitForTimeout(2000);
+
+    // Try clicking the specific email row inside the inbox iframe.
+    // The inbox is rendered in an <iframe id="ifinbox">; we use frameLocator.
+    const inboxFrame = page.frameLocator("#ifinbox");
+    const emailRow = inboxFrame.locator(`#e_${id}, [id="e_${id}"]`);
+
+    const rowExists = await emailRow.count().then((n) => n > 0).catch(() => false);
+
+    if (rowExists) {
+      logger.debug({ login, domain, id }, "Browser: clicking email row in inbox frame");
+      await emailRow.click({ timeout: 10000 });
+
+      // Wait for the mail iframe to update with the email content.
+      await page.waitForFunction(
+        () => {
+          const mailFrame = document.querySelector<HTMLIFrameElement>("#ifmail");
+          if (!mailFrame) return false;
+          try {
+            const body = mailFrame.contentDocument?.body;
+            return !!body && body.innerHTML.trim().length > 50;
+          } catch {
+            return false;
+          }
+        },
+        { timeout: 15000, polling: 500 },
+      ).catch(() => null);
+
+      // Extract mail frame HTML.
+      const mailFrameHandle = await page.$("#ifmail");
+      if (mailFrameHandle) {
+        const mailFrame = await mailFrameHandle.contentFrame();
+        if (mailFrame) {
+          const rawHtml = await mailFrame.content();
+          if (
+            rawHtml.includes("g-recaptcha") ||
+            rawHtml.includes("grecaptcha") ||
+            rawHtml.includes("recaptcha")
+          ) {
+            throw Object.assign(new Error("CAPTCHA_REQUIRED"), {
+              code: "CAPTCHA_REQUIRED",
+              yopmailUrl: wmUrl,
+            });
+          }
+          logger.debug({ login, domain, id }, "Browser: email fetched via iframe click");
+          return parseEmailHtml(rawHtml, id);
+        }
+      }
+    }
+
+    // Fallback: navigate the browser to /mail directly — the browser already has
+    // the correct cookies from visiting /en/wm, so this is still session-trusted.
+    logger.debug({ login, domain, id }, "Browser: inbox row not found — falling back to /mail navigation");
+
     const yp = await page.evaluate(() => {
-      const el = document.querySelector<HTMLInputElement>(
-        "#yp, input[name='yp']",
-      );
+      const el = document.querySelector<HTMLInputElement>("#yp, input[name='yp']");
       return el?.value ?? null;
     });
-
-    // Get yj from the already-cached value (avoids a second JS download).
     const yj = await fetchYj();
 
     if (!yp) {
       throw new Error("Browser: could not extract yp token from webmail page");
     }
 
-    // Now navigate the browser directly to the /mail endpoint.
-    // The browser carries all cookies and the proper fingerprint so
-    // Yopmail treats this as a continuation of the same session.
     const mailParams = new URLSearchParams({
       b: login,
       id: `me_${id}`,
@@ -404,7 +457,6 @@ async function fetchEmailWithBrowser(
       ...(isYopmail ? {} : { d: domain }),
     });
 
-    logger.debug({ login, domain, id }, "Browser: fetching mail endpoint");
     await page.goto(`${YOPMAIL_BASE}/mail?${mailParams.toString()}`, {
       waitUntil: "networkidle",
       timeout: 30000,
@@ -417,17 +469,13 @@ async function fetchEmailWithBrowser(
       rawHtml.includes("grecaptcha") ||
       rawHtml.includes("recaptcha")
     ) {
-      const yopmailUrl = wmUrl;
-      const err = new Error("CAPTCHA_REQUIRED") as Error & {
-        code: string;
-        yopmailUrl: string;
-      };
-      err.code = "CAPTCHA_REQUIRED";
-      err.yopmailUrl = yopmailUrl;
-      throw err;
+      throw Object.assign(new Error("CAPTCHA_REQUIRED"), {
+        code: "CAPTCHA_REQUIRED",
+        yopmailUrl: wmUrl,
+      });
     }
 
-    logger.debug({ login, domain, id }, "Browser: email fetched successfully");
+    logger.debug({ login, domain, id }, "Browser: email fetched successfully via /mail");
     return parseEmailHtml(rawHtml, id);
   } finally {
     await page.close();
