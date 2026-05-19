@@ -2,10 +2,10 @@ import { chromium, BrowserContext } from "playwright";
 import path from "path";
 import { logger } from "./logger";
 
-// Path to the unpacked RektCaptcha extension
+// Path to the unpacked Buster extension
 const EXTENSION_PATH = path.resolve(
   process.cwd(),
-  "artifacts/api-server/.extensions/rektcaptcha",
+  "artifacts/api-server/.extensions/buster",
 );
 
 const USER_DATA_DIR = path.join(process.cwd(), ".browser-data");
