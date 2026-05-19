@@ -315,7 +315,24 @@ export async function fetchEmail(
     timeout: 15000,
   });
 
-  const $ = cheerio.load(resp.data);
+  const rawHtml = resp.data as string;
+
+  if (
+    rawHtml.includes("g-recaptcha") ||
+    rawHtml.includes("grecaptcha") ||
+    rawHtml.includes("recaptcha")
+  ) {
+    const yopmailUrl = `https://yopmail.com/en/wm?login=${login}${!isYopmail ? `&domain=${domain}` : ""}`;
+    const err = new Error("CAPTCHA_REQUIRED") as Error & {
+      code: string;
+      yopmailUrl: string;
+    };
+    err.code = "CAPTCHA_REQUIRED";
+    err.yopmailUrl = yopmailUrl;
+    throw err;
+  }
+
+  const $ = cheerio.load(rawHtml);
 
   const from =
     $(".lmf").first().text().trim() ||

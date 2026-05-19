@@ -55,6 +55,11 @@ router.get("/email", async (req, res): Promise<void> => {
     const message = await fetchEmail(email, id);
     res.json(GetEmailResponse.parse(message));
   } catch (err) {
+    const e = err as Error & { code?: string; yopmailUrl?: string };
+    if (e.code === "CAPTCHA_REQUIRED") {
+      res.status(503).json({ error: "CAPTCHA_REQUIRED", yopmailUrl: e.yopmailUrl ?? null });
+      return;
+    }
     req.log.error({ err }, "Failed to fetch email");
     res.status(502).json({ error: "Failed to fetch email from mail server" });
   }

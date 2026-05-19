@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Search, RefreshCw, Mail, Moon, Sun, ChevronLeft, Plus, Settings } from "lucide-react";
+import { Search, RefreshCw, Mail, Moon, Sun, ChevronLeft, Plus, Settings, ExternalLink } from "lucide-react";
 import {
   useGetInbox,
   getGetInboxQueryKey,
@@ -22,6 +22,23 @@ function randomPrefix(len = 8) {
     { length: len },
     () => chars[Math.floor(Math.random() * chars.length)],
   ).join("");
+}
+
+function isCaptchaError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const data = (error as { data?: { error?: string } }).data;
+  return data?.error === "CAPTCHA_REQUIRED";
+}
+
+function getYopmailUrl(email: string): string {
+  const atIdx = email.indexOf("@");
+  if (atIdx === -1) return "https://yopmail.com";
+  const login = email.slice(0, atIdx);
+  const domain = email.slice(atIdx + 1);
+  const isYopmail = domain.includes("yopmail");
+  return isYopmail
+    ? `https://yopmail.com/en/wm?login=${login}`
+    : `https://yopmail.com/en/wm?login=${login}&domain=${domain}`;
 }
 
 function formatDate(dateStr: string) {
@@ -90,7 +107,7 @@ export default function InboxPage() {
     },
   );
 
-  const { data: emailData, isLoading: isLoadingEmail } = useGetEmail(
+  const { data: emailData, isLoading: isLoadingEmail, isError: isEmailError, error: emailError } = useGetEmail(
     { email: activeEmail, id: selectedId || "" },
     {
       query: {
@@ -230,6 +247,28 @@ export default function InboxPage() {
                     <div className="h-4 bg-gray-100 dark:bg-gray-700 rounded w-1/2" />
                     <div className="h-3 bg-gray-100 dark:bg-gray-700 rounded w-1/3" />
                     <div className="h-64 bg-gray-50 dark:bg-gray-700/50 rounded-lg mt-4" />
+                  </div>
+                ) : isEmailError && isCaptchaError(emailError) ? (
+                  <div className="text-center py-6 px-2">
+                    <div className="w-12 h-12 bg-yellow-50 dark:bg-yellow-900/20 rounded-full flex items-center justify-center mx-auto mb-3">
+                      <ExternalLink className="w-6 h-6 text-yellow-500" />
+                    </div>
+                    <p className="font-semibold text-gray-800 dark:text-white text-sm mb-1">
+                      CAPTCHA required by YopMail
+                    </p>
+                    <p className="text-xs text-gray-500 dark:text-gray-400 mb-4 leading-relaxed">
+                      YopMail is asking for a CAPTCHA to view this email.
+                      Open it directly on their site to complete the check.
+                    </p>
+                    <a
+                      href={getYopmailUrl(activeEmail)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-2 bg-green-500 hover:bg-green-600 active:bg-green-700 text-white text-sm font-semibold px-4 py-2.5 rounded-lg transition-colors"
+                    >
+                      <ExternalLink className="w-4 h-4" />
+                      Open on YopMail
+                    </a>
                   </div>
                 ) : emailData ? (
                   <div>
