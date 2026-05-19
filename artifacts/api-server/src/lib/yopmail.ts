@@ -1,5 +1,6 @@
 import axios from "axios";
 import * as cheerio from "cheerio";
+import { simpleParser } from "mailparser";
 import { logger } from "./logger";
 import { getBrowserContext } from "./browser";
 
@@ -83,14 +84,9 @@ function invalidateCachedSession(key: string): void {
   sessionCache.delete(key);
 }
 
-/**
- * Merge Set-Cookie headers from a response into an existing cookie string.
- * New values for the same cookie name override old ones.
- */
 function mergeCookies(existing: string, setCookieHeaders: string[]): string {
   const map = new Map<string, string>();
 
-  // Parse existing cookies into the map
   for (const pair of existing.split(";")) {
     const trimmed = pair.trim();
     if (!trimmed) continue;
@@ -102,7 +98,6 @@ function mergeCookies(existing: string, setCookieHeaders: string[]): string {
     }
   }
 
-  // Override/add from Set-Cookie headers (take only the name=value part before the first ";")
   for (const header of setCookieHeaders) {
     const nameValue = header.split(";")[0].trim();
     const eqIdx = nameValue.indexOf("=");
@@ -145,9 +140,6 @@ async function fetchYj(scriptPath?: string): Promise<string> {
   return yj;
 }
 
-/**
- * Get a base session (yp, yj, cookies) from the Yopmail homepage.
- */
 async function getSession(): Promise<Session> {
   const now = new Date();
   const ytime = `${now.getHours()}:${now.getMinutes()}`;
@@ -189,11 +181,6 @@ async function getSession(): Promise<Session> {
   return { yp, yj, cookies };
 }
 
-/**
- * Build or reuse a warmed session for a given inbox.
- * Visits the /inbox endpoint so Yopmail sets the cookies required by /mail.
- * Persists the result in the session cache so subsequent calls reuse it.
- */
 async function getOrCreateWarmedSession(
   cacheKey: string,
   login: string,
@@ -245,7 +232,6 @@ export async function fetchInbox(email: string): Promise<InboxResponse> {
   const isYopmail = domain.includes("yopmail");
   const cacheKey = `${login}@${domain}`;
 
-  // Reuse an existing warmed session if available; otherwise create one.
   let session = getCachedSession(cacheKey);
   if (!session) {
     logger.debug({ login, domain }, "No cached session — warming a new one");
@@ -277,7 +263,6 @@ export async function fetchInbox(email: string): Promise<InboxResponse> {
     timeout: 15000,
   });
 
-  // Absorb any fresh cookies yopmail sends back and update the cache.
   const freshCookies: string[] = ([] as string[]).concat(
     resp.headers["set-cookie"] ?? [],
   );
@@ -325,6 +310,122 @@ export async function fetchInbox(email: string): Promise<InboxResponse> {
   return { email, messages };
 }
 
+/**
+ * Parse raw EML data (from /downmail) into an EmailMessage using mailparser.
+ * Returns null if the data doesn't look like a valid email.
+ */
+async function parseEml(raw: Buffer | string, id: string): Promise<EmailMessage | null> {
+  try {
+    const parsed = await simpleParser(raw);
+
+    const fromAddr = parsed.from?.text ?? "";
+    const subject = parsed.subject ?? "(no subject)";
+    const date = parsed.date ? parsed.date.toUTCString() : "";
+
+    // Prefer HTML body; fall back to plain text wrapped in <pre>.
+    let html = parsed.html || "";
+    if (!html && parsed.text) {
+      html = `<pre style="white-space:pre-wrap;word-break:break-word;font-family:inherit">${parsed.text
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")}</pre>`;
+    }
+
+    if (!fromAddr && !subject && !html) return null;
+
+    return { id, from: fromAddr, subject, date, html };
+  } catch (err) {
+    logger.debug({ err }, "EML parse failed");
+    return null;
+  }
+}
+
+/**
+ * PRIMARY fetcher — calls YopMail's native /downmail endpoint.
+ *
+ * /downmail is the same endpoint the YopMail UI uses for its "Download"
+ * button. It returns the raw RFC-822 email (EML) directly, skipping the
+ * /mail web renderer that triggers CAPTCHA challenges.
+ *
+ * ID formats tried (in order): "e_<id>", "<id>", "me_<id>"
+ */
+async function fetchEmailViaDownload(
+  login: string,
+  domain: string,
+  isYopmail: boolean,
+  id: string,
+  session: Session,
+): Promise<EmailMessage> {
+  const referer = isYopmail
+    ? `${YOPMAIL_BASE}/en/wm?login=${login}`
+    : `${YOPMAIL_BASE}/en/wm?login=${login}&domain=${domain}`;
+
+  const downloadHeaders = {
+    ...BASE_HEADERS,
+    Accept: "message/rfc822, application/octet-stream, */*",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    Cookie: session.cookies,
+    Referer: referer,
+  };
+
+  // YopMail's JS passes the raw inbox element ID (e.g. "e_abc123") to /downmail.
+  // We strip the "e_" prefix when storing in our InboxItem, so we try both forms.
+  const idCandidates = [`e_${id}`, id, `me_${id}`];
+
+  for (const candidate of idCandidates) {
+    const params: Record<string, string> = { b: login, id: candidate };
+    if (!isYopmail) params.d = domain;
+
+    logger.debug({ login, id: candidate }, "Downmail: trying id format");
+
+    try {
+      const resp = await axios.get(`${YOPMAIL_BASE}/downmail`, {
+        params,
+        headers: downloadHeaders,
+        responseType: "arraybuffer",
+        timeout: 15000,
+        maxRedirects: 3,
+        validateStatus: (s) => s < 500,
+      });
+
+      if (resp.status === 400 || resp.status === 404) {
+        logger.debug({ id: candidate, status: resp.status }, "Downmail: bad id format, trying next");
+        continue;
+      }
+
+      const contentType = (resp.headers["content-type"] as string | undefined) ?? "";
+      const rawBuffer = Buffer.from(resp.data as ArrayBuffer);
+
+      // If we got an HTML page back (e.g. redirect to homepage or CAPTCHA page)
+      // instead of a raw email, skip this candidate.
+      if (
+        contentType.includes("text/html") ||
+        rawBuffer.slice(0, 20).toString().trimStart().startsWith("<!") ||
+        rawBuffer.slice(0, 20).toString().trimStart().startsWith("<html")
+      ) {
+        logger.debug({ id: candidate, contentType }, "Downmail: got HTML instead of EML — skipping");
+        continue;
+      }
+
+      logger.debug({ id: candidate, contentType, bytes: rawBuffer.length }, "Downmail: got EML response");
+
+      const message = await parseEml(rawBuffer, id);
+      if (message) {
+        logger.info({ login, id }, "Email fetched via /downmail (no CAPTCHA)");
+        return message;
+      }
+
+      logger.debug({ id: candidate }, "Downmail: EML parse returned null, trying next");
+    } catch (err) {
+      logger.debug({ id: candidate, err }, "Downmail: request error, trying next");
+    }
+  }
+
+  throw new Error(`/downmail failed for all ID formats (login=${login}, id=${id})`);
+}
+
 function parseEmailHtml(rawHtml: string, id: string): EmailMessage {
   const $ = cheerio.load(rawHtml);
   const from =
@@ -354,13 +455,8 @@ function parseEmailHtml(rawHtml: string, id: string): EmailMessage {
 }
 
 /**
- * Fetch an email using a real headless browser by interacting with the
- * YopMail webmail UI naturally — navigating to the webmail page, waiting
- * for the inbox iframe to load, clicking the target email row, then
- * extracting the content from the mail iframe.
- *
- * This human-like interaction pattern avoids bot detection far better than
- * navigating directly to the /mail endpoint.
+ * FALLBACK — headless browser that clicks the email row naturally.
+ * Only used if /downmail fails.
  */
 async function fetchEmailWithBrowser(
   login: string,
@@ -377,27 +473,18 @@ async function fetchEmailWithBrowser(
 
   try {
     logger.debug({ login, domain, id }, "Browser: navigating to webmail");
-
     await page.goto(wmUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
-
-    // Wait for the inbox iframe to appear in the DOM.
     await page.waitForSelector("#ifinbox", { timeout: 20000 }).catch(() => null);
-
-    // Give the inbox iframe time to fully load its content.
     await page.waitForTimeout(2000);
 
-    // Try clicking the specific email row inside the inbox iframe.
-    // The inbox is rendered in an <iframe id="ifinbox">; we use frameLocator.
     const inboxFrame = page.frameLocator("#ifinbox");
     const emailRow = inboxFrame.locator(`#e_${id}, [id="e_${id}"]`);
-
     const rowExists = await emailRow.count().then((n) => n > 0).catch(() => false);
 
     if (rowExists) {
       logger.debug({ login, domain, id }, "Browser: clicking email row in inbox frame");
       await emailRow.click({ timeout: 10000 });
 
-      // Wait for the mail iframe to update with the email content.
       await page.waitForFunction(
         () => {
           const mailFrame = document.querySelector<HTMLIFrameElement>("#ifmail");
@@ -412,7 +499,6 @@ async function fetchEmailWithBrowser(
         { timeout: 15000, polling: 500 },
       ).catch(() => null);
 
-      // Extract mail frame HTML.
       const mailFrameHandle = await page.$("#ifmail");
       if (mailFrameHandle) {
         const mailFrame = await mailFrameHandle.contentFrame();
@@ -434,9 +520,7 @@ async function fetchEmailWithBrowser(
       }
     }
 
-    // Fallback: navigate the browser to /mail directly — the browser already has
-    // the correct cookies from visiting /en/wm, so this is still session-trusted.
-    logger.debug({ login, domain, id }, "Browser: inbox row not found — falling back to /mail navigation");
+    logger.debug({ login, domain, id }, "Browser: inbox row not found — navigating to /mail");
 
     const yp = await page.evaluate(() => {
       const el = document.querySelector<HTMLInputElement>("#yp, input[name='yp']");
@@ -444,9 +528,7 @@ async function fetchEmailWithBrowser(
     });
     const yj = await fetchYj();
 
-    if (!yp) {
-      throw new Error("Browser: could not extract yp token from webmail page");
-    }
+    if (!yp) throw new Error("Browser: could not extract yp token");
 
     const mailParams = new URLSearchParams({
       b: login,
@@ -475,7 +557,7 @@ async function fetchEmailWithBrowser(
       });
     }
 
-    logger.debug({ login, domain, id }, "Browser: email fetched successfully via /mail");
+    logger.debug({ login, domain, id }, "Browser: email fetched via /mail");
     return parseEmailHtml(rawHtml, id);
   } finally {
     await page.close();
@@ -493,43 +575,46 @@ export async function fetchEmail(
   const isYopmail = domain.includes("yopmail");
   const cacheKey = `${login}@${domain}`;
 
-  // Try the headless browser first — it executes JavaScript challenges and
-  // carries a persistent cookie jar, greatly reducing CAPTCHA triggers.
-  try {
-    return await fetchEmailWithBrowser(login, domain, isYopmail, id);
-  } catch (browserErr) {
-    const be = browserErr as Error & { code?: string; yopmailUrl?: string };
-
-    // If the browser itself detected CAPTCHA, propagate it — no point retrying with axios.
-    if (be.code === "CAPTCHA_REQUIRED") throw browserErr;
-
-    logger.warn(
-      { err: be.message },
-      "Browser fetch failed — falling back to axios",
-    );
-  }
-
-  // Axios fallback: reuse the warmed session if available.
+  // Ensure we have a warmed session (needed for /downmail cookies).
   let session = getCachedSession(cacheKey);
   if (!session) {
-    logger.debug({ login, domain }, "No cached session for email fetch — warming");
+    logger.debug({ login, domain }, "No cached session — warming for downmail");
     session = await getOrCreateWarmedSession(cacheKey, login, domain, isYopmail);
   }
 
-  logger.debug({ login, domain, id }, "Axios fallback: fetching email");
+  // ── STEP 1: Native /downmail — raw EML, no browser, no CAPTCHA ──────────
+  try {
+    return await fetchEmailViaDownload(login, domain, isYopmail, id, session);
+  } catch (dlErr) {
+    logger.warn(
+      { err: (dlErr as Error).message },
+      "Downmail failed — falling back to browser",
+    );
+  }
 
-  const mailId = `me_${id}`;
+  // ── STEP 2: Headless browser — natural UI interaction ────────────────────
+  try {
+    return await fetchEmailWithBrowser(login, domain, isYopmail, id);
+  } catch (browserErr) {
+    const be = browserErr as Error & { code?: string };
+    if (be.code === "CAPTCHA_REQUIRED") throw browserErr;
+    logger.warn(
+      { err: be.message },
+      "Browser fetch failed — falling back to axios /mail",
+    );
+  }
+
+  // ── STEP 3: Axios /mail — last resort ────────────────────────────────────
+  logger.debug({ login, domain, id }, "Axios /mail fallback");
+
   const params: Record<string, string> = {
     b: login,
-    id: mailId,
+    id: `me_${id}`,
     yp: session.yp,
     yj: session.yj,
     v: VER,
   };
-
-  if (!isYopmail) {
-    params.d = domain;
-  }
+  if (!isYopmail) params.d = domain;
 
   const resp = await axios.get(`${YOPMAIL_BASE}/mail`, {
     params,
@@ -549,14 +634,11 @@ export async function fetchEmail(
     rawHtml.includes("recaptcha")
   ) {
     invalidateCachedSession(cacheKey);
-    const yopmailUrl = `https://yopmail.com/en/wm?login=${login}${!isYopmail ? `&domain=${domain}` : ""}`;
-    const err = new Error("CAPTCHA_REQUIRED") as Error & {
-      code: string;
-      yopmailUrl: string;
-    };
-    err.code = "CAPTCHA_REQUIRED";
-    err.yopmailUrl = yopmailUrl;
-    throw err;
+    const yopmailUrl = `${YOPMAIL_BASE}/en/wm?login=${login}${!isYopmail ? `&domain=${domain}` : ""}`;
+    throw Object.assign(new Error("CAPTCHA_REQUIRED"), {
+      code: "CAPTCHA_REQUIRED",
+      yopmailUrl,
+    });
   }
 
   return parseEmailHtml(rawHtml, id);
