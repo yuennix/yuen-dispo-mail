@@ -1,6 +1,7 @@
 import axios from "axios";
 import * as cheerio from "cheerio";
 import { logger } from "./logger";
+import { getBrowserContext } from "./browser";
 
 const YOPMAIL_BASE = "https://yopmail.com";
 const VER = "9.3";
@@ -324,6 +325,115 @@ export async function fetchInbox(email: string): Promise<InboxResponse> {
   return { email, messages };
 }
 
+function parseEmailHtml(rawHtml: string, id: string): EmailMessage {
+  const $ = cheerio.load(rawHtml);
+  const from =
+    $(".lmf").first().text().trim() ||
+    $('[class*="from"]').first().text().trim() ||
+    "";
+  const subject =
+    $(".lms").first().text().trim() ||
+    $("title").text().replace(/yopmail/i, "").trim() ||
+    "(no subject)";
+  const date = $(".lmh, .lmd, .date").first().text().trim() || "";
+
+  let html = "";
+  const mailBody = $(
+    "#mail, #mailmillieu, .mail-body, .message-content, #messagectn",
+  );
+  if (mailBody.length > 0) {
+    html = mailBody.html() ?? "";
+  } else {
+    $("script").remove();
+    $("link[rel='stylesheet']").remove();
+    $("meta").remove();
+    html = $("body").html() ?? rawHtml;
+  }
+
+  return { id, from, subject, date, html };
+}
+
+/**
+ * Fetch an email using a real headless browser.
+ * The persistent browser context accumulates cookies and executes JavaScript
+ * challenges, making it appear as a genuine returning user to Yopmail.
+ */
+async function fetchEmailWithBrowser(
+  login: string,
+  domain: string,
+  isYopmail: boolean,
+  id: string,
+): Promise<EmailMessage> {
+  const wmUrl = isYopmail
+    ? `${YOPMAIL_BASE}/en/wm?login=${login}`
+    : `${YOPMAIL_BASE}/en/wm?login=${login}&domain=${domain}`;
+
+  const ctx = await getBrowserContext();
+  const page = await ctx.newPage();
+
+  try {
+    logger.debug({ login, domain, id }, "Browser: navigating to webmail");
+
+    // Visit the webmail page — this executes JS, sets cookies, builds trust.
+    await page.goto(wmUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+
+    // Extract the yp token the page injected into the DOM.
+    const yp = await page.evaluate(() => {
+      const el = document.querySelector<HTMLInputElement>(
+        "#yp, input[name='yp']",
+      );
+      return el?.value ?? null;
+    });
+
+    // Get yj from the already-cached value (avoids a second JS download).
+    const yj = await fetchYj();
+
+    if (!yp) {
+      throw new Error("Browser: could not extract yp token from webmail page");
+    }
+
+    // Now navigate the browser directly to the /mail endpoint.
+    // The browser carries all cookies and the proper fingerprint so
+    // Yopmail treats this as a continuation of the same session.
+    const mailParams = new URLSearchParams({
+      b: login,
+      id: `me_${id}`,
+      yp,
+      yj,
+      v: VER,
+      ...(isYopmail ? {} : { d: domain }),
+    });
+
+    logger.debug({ login, domain, id }, "Browser: fetching mail endpoint");
+    await page.goto(`${YOPMAIL_BASE}/mail?${mailParams.toString()}`, {
+      waitUntil: "networkidle",
+      timeout: 30000,
+    });
+
+    const rawHtml = await page.content();
+
+    if (
+      rawHtml.includes("g-recaptcha") ||
+      rawHtml.includes("grecaptcha") ||
+      rawHtml.includes("recaptcha")
+    ) {
+      const yopmailUrl = wmUrl;
+      const err = new Error("CAPTCHA_REQUIRED") as Error & {
+        code: string;
+        yopmailUrl: string;
+      };
+      err.code = "CAPTCHA_REQUIRED";
+      err.yopmailUrl = yopmailUrl;
+      throw err;
+    }
+
+    logger.debug({ login, domain, id }, "Browser: email fetched successfully");
+    return parseEmailHtml(rawHtml, id);
+  } finally {
+    await page.close();
+  }
+}
+
 export async function fetchEmail(
   email: string,
   id: string,
@@ -335,20 +445,31 @@ export async function fetchEmail(
   const isYopmail = domain.includes("yopmail");
   const cacheKey = `${login}@${domain}`;
 
-  // Reuse the warmed session from the inbox fetch if available; otherwise warm one now.
+  // Try the headless browser first — it executes JavaScript challenges and
+  // carries a persistent cookie jar, greatly reducing CAPTCHA triggers.
+  try {
+    return await fetchEmailWithBrowser(login, domain, isYopmail, id);
+  } catch (browserErr) {
+    const be = browserErr as Error & { code?: string; yopmailUrl?: string };
+
+    // If the browser itself detected CAPTCHA, propagate it — no point retrying with axios.
+    if (be.code === "CAPTCHA_REQUIRED") throw browserErr;
+
+    logger.warn(
+      { err: be.message },
+      "Browser fetch failed — falling back to axios",
+    );
+  }
+
+  // Axios fallback: reuse the warmed session if available.
   let session = getCachedSession(cacheKey);
   if (!session) {
     logger.debug({ login, domain }, "No cached session for email fetch — warming");
     session = await getOrCreateWarmedSession(cacheKey, login, domain, isYopmail);
-  } else {
-    logger.debug({ login, domain }, "Reusing cached session for email fetch");
   }
 
-  logger.debug({ login, domain, id }, "Fetching email");
+  logger.debug({ login, domain, id }, "Axios fallback: fetching email");
 
-  // Yopmail's /mail endpoint expects id = "m" + elementId, where elementId is the
-  // inbox DOM attribute value "e_<base64>". Since fetchInbox stores ids with the
-  // "e_" prefix stripped, we reconstruct the full id as "me_<id>".
   const mailId = `me_${id}`;
   const params: Record<string, string> = {
     b: login,
@@ -379,7 +500,6 @@ export async function fetchEmail(
     rawHtml.includes("grecaptcha") ||
     rawHtml.includes("recaptcha")
   ) {
-    // Invalidate the stale session so the next request gets a fresh one.
     invalidateCachedSession(cacheKey);
     const yopmailUrl = `https://yopmail.com/en/wm?login=${login}${!isYopmail ? `&domain=${domain}` : ""}`;
     const err = new Error("CAPTCHA_REQUIRED") as Error & {
@@ -391,30 +511,5 @@ export async function fetchEmail(
     throw err;
   }
 
-  const $ = cheerio.load(rawHtml);
-
-  const from =
-    $(".lmf").first().text().trim() ||
-    $('[class*="from"]').first().text().trim() ||
-    "";
-  const subject =
-    $(".lms").first().text().trim() ||
-    $("title").text().replace(/yopmail/i, "").trim() ||
-    "(no subject)";
-  const date = $(".lmh, .lmd, .date").first().text().trim() || "";
-
-  let html = "";
-  const mailBody = $(
-    "#mail, #mailmillieu, .mail-body, .message-content, #messagectn",
-  );
-  if (mailBody.length > 0) {
-    html = mailBody.html() ?? "";
-  } else {
-    $("script").remove();
-    $("link[rel='stylesheet']").remove();
-    $("meta").remove();
-    html = $("body").html() ?? resp.data;
-  }
-
-  return { id, from, subject, date, html };
+  return parseEmailHtml(rawHtml, id);
 }
