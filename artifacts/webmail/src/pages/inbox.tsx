@@ -1,5 +1,5 @@
-import { useState, useEffect } from "react";
-import { Search, RefreshCw, Mail, Moon, Sun, ChevronLeft, Plus, Settings, ExternalLink } from "lucide-react";
+import { useState, useEffect, useCallback } from "react";
+import { Search, RefreshCw, Mail, Moon, Sun, ChevronLeft, Plus, Settings, ExternalLink, Copy, Check } from "lucide-react";
 import {
   useGetInbox,
   getGetInboxQueryKey,
@@ -71,6 +71,92 @@ function formatDate(dateStr: string) {
   } catch {
     return dateStr;
   }
+}
+
+interface MessageRowProps {
+  msg: { id: string; from: string; subject: string; date: string; isRead: boolean };
+  otp: string | null;
+  onClick: () => void;
+}
+
+function OtpMessageRow({ msg, otp, onClick }: MessageRowProps) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = useCallback(
+    (e: React.MouseEvent) => {
+      e.stopPropagation();
+      if (!otp) return;
+      navigator.clipboard.writeText(otp).then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+      });
+    },
+    [otp],
+  );
+
+  return (
+    <div className="relative">
+      <button
+        onClick={onClick}
+        className="w-full text-left p-3 border border-gray-100 dark:border-gray-700 rounded-xl hover:bg-gray-50 dark:hover:bg-gray-700/60 active:bg-gray-100 transition-colors"
+      >
+        <div className="flex items-center justify-between mb-0.5">
+          <span
+            className={`text-sm truncate max-w-[200px] ${
+              !msg.isRead
+                ? "font-bold text-gray-900 dark:text-white"
+                : "font-medium text-gray-600 dark:text-gray-400"
+            }`}
+          >
+            {msg.from || "Unknown Sender"}
+          </span>
+          <span className="text-xs text-gray-400 dark:text-gray-500 flex-shrink-0 ml-2">
+            {formatDate(msg.date)}
+          </span>
+        </div>
+        <p
+          className={`text-xs truncate ${otp ? "max-w-[calc(100%-3rem)]" : ""} ${
+            !msg.isRead
+              ? "text-gray-700 dark:text-gray-300"
+              : "text-gray-400 dark:text-gray-500"
+          }`}
+        >
+          {msg.subject || "(No Subject)"}
+        </p>
+        {otp && (
+          <div className="mt-1.5 flex items-center gap-1.5">
+            <span className="inline-flex items-center gap-1 bg-green-50 dark:bg-green-900/30 border border-green-200 dark:border-green-700 text-green-700 dark:text-green-300 text-xs font-mono font-bold px-2 py-0.5 rounded-md tracking-widest">
+              {otp}
+            </span>
+            <span className="text-xs text-gray-400 dark:text-gray-500">detected</span>
+          </div>
+        )}
+        {!msg.isRead && !otp && (
+          <span className="inline-block mt-1 w-2 h-2 rounded-full bg-green-500" />
+        )}
+      </button>
+
+      {otp && (
+        <button
+          onClick={handleCopy}
+          title="Copy code"
+          className="absolute right-2 bottom-2 flex items-center gap-1 text-xs bg-green-500 hover:bg-green-600 active:bg-green-700 text-white px-2 py-1 rounded-lg transition-colors"
+        >
+          {copied ? (
+            <>
+              <Check className="w-3 h-3" />
+              Copied
+            </>
+          ) : (
+            <>
+              <Copy className="w-3 h-3" />
+              Copy
+            </>
+          )}
+        </button>
+      )}
+    </div>
+  );
 }
 
 export default function InboxPage() {
@@ -361,40 +447,17 @@ export default function InboxPage() {
                   </p>
                 ) : (
                   <div className="space-y-2">
-                    {inboxData.messages.map((msg) => (
-                      <button
-                        key={msg.id}
-                        onClick={() => setSelectedId(msg.id)}
-                        className="w-full text-left p-3 border border-gray-100 dark:border-gray-700 rounded-xl hover:bg-gray-50 dark:hover:bg-gray-700/60 active:bg-gray-100 transition-colors"
-                      >
-                        <div className="flex items-center justify-between mb-0.5">
-                          <span
-                            className={`text-sm truncate max-w-[200px] ${
-                              !msg.isRead
-                                ? "font-bold text-gray-900 dark:text-white"
-                                : "font-medium text-gray-600 dark:text-gray-400"
-                            }`}
-                          >
-                            {msg.from || "Unknown Sender"}
-                          </span>
-                          <span className="text-xs text-gray-400 dark:text-gray-500 flex-shrink-0 ml-2">
-                            {formatDate(msg.date)}
-                          </span>
-                        </div>
-                        <p
-                          className={`text-xs truncate ${
-                            !msg.isRead
-                              ? "text-gray-700 dark:text-gray-300"
-                              : "text-gray-400 dark:text-gray-500"
-                          }`}
-                        >
-                          {msg.subject || "(No Subject)"}
-                        </p>
-                        {!msg.isRead && (
-                          <span className="inline-block mt-1 w-2 h-2 rounded-full bg-green-500" />
-                        )}
-                      </button>
-                    ))}
+                    {inboxData.messages.map((msg) => {
+                      const otp = extractOtp(msg.subject || "");
+                      return (
+                        <OtpMessageRow
+                          key={msg.id}
+                          msg={msg}
+                          otp={otp}
+                          onClick={() => setSelectedId(msg.id)}
+                        />
+                      );
+                    })}
                   </div>
                 )}
               </div>
