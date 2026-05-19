@@ -522,7 +522,23 @@ async function solveCaptchaIfPresent(
     }
   }, token);
 
-  logger.info({ pageUrl }, "CAPTCHA token injected successfully");
+  // Try to find and submit the form / trigger the callback
+  await pageOrFrame.evaluate((t: string) => {
+    // Click submit button if present
+    const submitBtn =
+      document.querySelector<HTMLElement>("button[type='submit']") ??
+      document.querySelector<HTMLElement>("input[type='submit']") ??
+      document.querySelector<HTMLElement>(".btn-submit, #submit, button.submit");
+    if (submitBtn) {
+      submitBtn.click();
+      return;
+    }
+    // Fall back to form submit
+    const form = document.querySelector<HTMLFormElement>("form");
+    if (form) form.submit();
+  }, token);
+
+  logger.info({ pageUrl }, "CAPTCHA token injected and form submitted");
   return true;
 }
 
@@ -708,32 +724,85 @@ export async function fetchEmail(
   // ── STEP 3: Axios /mail — last resort ────────────────────────────────────
   logger.debug({ login, domain, id }, "Axios /mail fallback");
 
-  const params: Record<string, string> = {
+  const mailParams: Record<string, string> = {
     b: login,
     id: `me_${id}`,
     yp: session.yp,
     yj: session.yj,
     v: VER,
   };
-  if (!isYopmail) params.d = domain;
+  if (!isYopmail) mailParams.d = domain;
+
+  const mailHeaders = {
+    ...IFRAME_HEADERS,
+    Cookie: session.cookies,
+    Referer: `${YOPMAIL_BASE}/`,
+  };
 
   const resp = await axios.get(`${YOPMAIL_BASE}/mail`, {
-    params,
-    headers: {
-      ...IFRAME_HEADERS,
-      Cookie: session.cookies,
-      Referer: `${YOPMAIL_BASE}/`,
-    },
+    params: mailParams,
+    headers: mailHeaders,
     timeout: 15000,
   });
 
-  const rawHtml = resp.data as string;
+  let rawHtml = resp.data as string;
 
+  // ── CAPTCHA detected in axios response — try to solve automatically ──────
   if (
     rawHtml.includes("g-recaptcha") ||
     rawHtml.includes("grecaptcha") ||
     rawHtml.includes("recaptcha")
   ) {
+    logger.info({ login, id }, "Axios /mail: CAPTCHA detected — attempting auto-solve");
+
+    const $ = cheerio.load(rawHtml);
+    const sitekey =
+      $(".g-recaptcha[data-sitekey]").attr("data-sitekey") ??
+      $("[data-sitekey]").attr("data-sitekey");
+
+    if (sitekey && process.env["FASTCAPTCHA_API_KEY"]) {
+      try {
+        const pageUrl = `${YOPMAIL_BASE}/en/wm?login=${login}${!isYopmail ? `&domain=${domain}` : ""}`;
+        const token = await solveRecaptchaV2(pageUrl, sitekey);
+
+        // Re-POST /mail with the captcha solution token
+        const postData = new URLSearchParams({
+          ...mailParams,
+          "g-recaptcha-response": token,
+        });
+
+        const retryResp = await axios.post(
+          `${YOPMAIL_BASE}/mail`,
+          postData.toString(),
+          {
+            headers: {
+              ...mailHeaders,
+              "Content-Type": "application/x-www-form-urlencoded",
+              Origin: YOPMAIL_BASE,
+            },
+            timeout: 20000,
+            maxRedirects: 5,
+          },
+        );
+
+        rawHtml = retryResp.data as string;
+
+        // If still showing captcha after solve attempt, fall through to error
+        if (
+          !rawHtml.includes("g-recaptcha") &&
+          !rawHtml.includes("grecaptcha") &&
+          !rawHtml.includes("recaptcha")
+        ) {
+          logger.info({ login, id }, "Axios /mail: CAPTCHA solved and email fetched");
+          return parseEmailHtml(rawHtml, id);
+        }
+
+        logger.warn({ login, id }, "Axios /mail: still seeing CAPTCHA after solve attempt");
+      } catch (captchaErr) {
+        logger.warn({ err: (captchaErr as Error).message }, "Axios /mail: CAPTCHA solve failed");
+      }
+    }
+
     invalidateCachedSession(cacheKey);
     const yopmailUrl = `${YOPMAIL_BASE}/en/wm?login=${login}${!isYopmail ? `&domain=${domain}` : ""}`;
     throw Object.assign(new Error("CAPTCHA_REQUIRED"), {

@@ -219,6 +219,8 @@ export default function InboxPage() {
           email: activeEmail,
           id: selectedId || "",
         }),
+        retry: (failureCount, error) => isCaptchaError(error) && failureCount < 6,
+        retryDelay: 6000,
       },
     },
   );
@@ -344,34 +346,17 @@ export default function InboxPage() {
                   Back to Inbox
                 </button>
 
-                {isLoadingEmail ? (
+                {(isLoadingEmail || (isEmailError && isCaptchaError(emailError))) ? (
                   <div className="space-y-3 animate-pulse">
                     <div className="h-5 bg-gray-100 dark:bg-gray-700 rounded w-3/4" />
                     <div className="h-4 bg-gray-100 dark:bg-gray-700 rounded w-1/2" />
                     <div className="h-3 bg-gray-100 dark:bg-gray-700 rounded w-1/3" />
                     <div className="h-64 bg-gray-50 dark:bg-gray-700/50 rounded-lg mt-4" />
-                  </div>
-                ) : isEmailError && isCaptchaError(emailError) ? (
-                  <div className="text-center py-6 px-2">
-                    <div className="w-12 h-12 bg-yellow-50 dark:bg-yellow-900/20 rounded-full flex items-center justify-center mx-auto mb-3">
-                      <ExternalLink className="w-6 h-6 text-yellow-500" />
-                    </div>
-                    <p className="font-semibold text-gray-800 dark:text-white text-sm mb-1">
-                      CAPTCHA required by YopMail
-                    </p>
-                    <p className="text-xs text-gray-500 dark:text-gray-400 mb-4 leading-relaxed">
-                      YopMail is asking for a CAPTCHA to view this email.
-                      Open it directly on their site to complete the check.
-                    </p>
-                    <a
-                      href={getYopmailUrl(activeEmail)}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="inline-flex items-center gap-2 bg-green-500 hover:bg-green-600 active:bg-green-700 text-white text-sm font-semibold px-4 py-2.5 rounded-lg transition-colors"
-                    >
-                      <ExternalLink className="w-4 h-4" />
-                      Open on YopMail
-                    </a>
+                    {isCaptchaError(emailError) && (
+                      <p className="text-xs text-center text-gray-400 dark:text-gray-500 pt-2">
+                        Solving verification automatically…
+                      </p>
+                    )}
                   </div>
                 ) : emailData ? (
                   <div>
