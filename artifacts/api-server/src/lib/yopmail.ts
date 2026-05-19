@@ -3,6 +3,7 @@ import * as cheerio from "cheerio";
 import { simpleParser } from "mailparser";
 import { logger } from "./logger";
 import { getBrowserContext } from "./browser";
+import { solveRecaptchaV2 } from "./captcha";
 
 const YOPMAIL_BASE = "https://yopmail.com";
 const VER = "9.3";
@@ -461,6 +462,71 @@ function parseEmailHtml(rawHtml: string, id: string): EmailMessage {
 }
 
 /**
+ * Detect reCAPTCHA on a Playwright page/frame and solve it automatically.
+ * Returns true if a captcha was found and solved, false if none was present.
+ * Throws if solving fails.
+ */
+async function solveCaptchaIfPresent(
+  pageOrFrame: import("playwright").Page | import("playwright").Frame,
+  pageUrl: string,
+): Promise<boolean> {
+  const html = await pageOrFrame.content();
+  const hasCaptcha =
+    html.includes("g-recaptcha") ||
+    html.includes("grecaptcha") ||
+    html.includes("recaptcha");
+
+  if (!hasCaptcha) return false;
+
+  logger.info({ pageUrl }, "CAPTCHA detected — attempting to solve via FastCaptcha");
+
+  const sitekey = await pageOrFrame.evaluate(() => {
+    const el =
+      document.querySelector<HTMLElement>(".g-recaptcha[data-sitekey]") ??
+      document.querySelector<HTMLElement>("[data-sitekey]");
+    return el?.getAttribute("data-sitekey") ?? null;
+  });
+
+  if (!sitekey) {
+    logger.warn({ pageUrl }, "CAPTCHA present but sitekey not found — cannot auto-solve");
+    return false;
+  }
+
+  logger.info({ sitekey, pageUrl }, "Extracted reCAPTCHA sitekey, sending to FastCaptcha");
+  const token = await solveRecaptchaV2(pageUrl, sitekey);
+
+  await pageOrFrame.evaluate((t: string) => {
+    const responseEl = document.getElementById("g-recaptcha-response") as HTMLTextAreaElement | null;
+    if (responseEl) {
+      responseEl.style.display = "block";
+      responseEl.value = t;
+    }
+
+    const allResponseEls = document.querySelectorAll<HTMLTextAreaElement>("textarea[name='g-recaptcha-response']");
+    allResponseEls.forEach((el) => {
+      el.value = t;
+    });
+
+    const captchaCallbackEl = document.querySelector<HTMLElement>(".g-recaptcha[data-callback]");
+    const callbackName = captchaCallbackEl?.getAttribute("data-callback");
+    if (callbackName && typeof (window as Record<string, unknown>)[callbackName] === "function") {
+      (window as Record<string, unknown>)[callbackName](t);
+    } else if (typeof (window as { grecaptcha?: { execute?: () => void } }).grecaptcha?.execute === "function") {
+      const gr = window as { ___grecaptcha_cfg?: { clients?: Record<string, { callback?: (t: string) => void }> } };
+      const clients = gr.___grecaptcha_cfg?.clients;
+      if (clients) {
+        Object.values(clients).forEach((client) => {
+          if (typeof client.callback === "function") client.callback(t);
+        });
+      }
+    }
+  }, token);
+
+  logger.info({ pageUrl }, "CAPTCHA token injected successfully");
+  return true;
+}
+
+/**
  * FALLBACK — headless browser that clicks the email row naturally.
  * Only used if /downmail fails.
  */
@@ -509,6 +575,20 @@ async function fetchEmailWithBrowser(
       if (mailFrameHandle) {
         const mailFrame = await mailFrameHandle.contentFrame();
         if (mailFrame) {
+          const solved = await solveCaptchaIfPresent(mailFrame, wmUrl);
+          if (solved) {
+            await page.waitForTimeout(3000);
+            const retryHtml = await mailFrame.content();
+            if (
+              !retryHtml.includes("g-recaptcha") &&
+              !retryHtml.includes("grecaptcha") &&
+              !retryHtml.includes("recaptcha")
+            ) {
+              logger.info({ login, domain, id }, "Browser: captcha solved, email fetched via iframe");
+              return parseEmailHtml(retryHtml, id);
+            }
+          }
+
           const rawHtml = await mailFrame.content();
           if (
             rawHtml.includes("g-recaptcha") ||
@@ -545,10 +625,25 @@ async function fetchEmailWithBrowser(
       ...(isYopmail ? {} : { d: domain }),
     });
 
-    await page.goto(`${YOPMAIL_BASE}/mail?${mailParams.toString()}`, {
+    const mailPageUrl = `${YOPMAIL_BASE}/mail?${mailParams.toString()}`;
+    await page.goto(mailPageUrl, {
       waitUntil: "networkidle",
       timeout: 30000,
     });
+
+    const solved = await solveCaptchaIfPresent(page, wmUrl);
+    if (solved) {
+      await page.waitForTimeout(3000);
+      const retryHtml = await page.content();
+      if (
+        !retryHtml.includes("g-recaptcha") &&
+        !retryHtml.includes("grecaptcha") &&
+        !retryHtml.includes("recaptcha")
+      ) {
+        logger.info({ login, domain, id }, "Browser: captcha solved, email fetched via /mail");
+        return parseEmailHtml(retryHtml, id);
+      }
+    }
 
     const rawHtml = await page.content();
 
