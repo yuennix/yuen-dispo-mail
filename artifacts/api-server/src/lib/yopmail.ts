@@ -461,88 +461,90 @@ function parseEmailHtml(rawHtml: string, id: string): EmailMessage {
   return { id, from, subject, date, html };
 }
 
-/** Check if any accessible frame on the page currently has a reCAPTCHA. */
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/**
+ * Returns true only if the HTML contains a *visible* reCAPTCHA challenge widget —
+ * not just the grecaptcha library script that yopmail always loads.
+ */
+function htmlHasActiveCaptcha(html: string): boolean {
+  return (
+    html.includes('class="g-recaptcha"') ||
+    html.includes("class='g-recaptcha'") ||
+    /data-sitekey=["'][^"']+["']/.test(html) ||
+    html.includes("https://www.google.com/recaptcha/api2/anchor") ||
+    html.includes("https://www.recaptcha.net/recaptcha/api2/anchor")
+  );
+}
+
+/** Check if a Page has an active reCAPTCHA widget (checks page + all child frames). */
 async function pageHasCaptcha(page: import("playwright").Page): Promise<boolean> {
+  try {
+    if (htmlHasActiveCaptcha(await page.content())) return true;
+  } catch { /* ignore */ }
   for (const f of page.frames()) {
     try {
-      const html = await f.content();
-      if (html.includes("g-recaptcha") || html.includes("grecaptcha") || html.includes("recaptcha")) {
-        return true;
-      }
+      if (htmlHasActiveCaptcha(await f.content())) return true;
     } catch { /* cross-origin frame */ }
   }
   return false;
 }
 
-/**
- * Wait for the RektCaptcha extension to auto-solve a reCAPTCHA on the page.
- * Polls until the captcha disappears or the timeout is reached.
- * Returns true if the captcha was resolved, false if it timed out.
- */
-async function waitForExtensionToSolveCaptcha(
-  page: import("playwright").Page,
-  pageUrl: string,
-  timeoutMs = 60000,
-): Promise<boolean> {
-  if (!(await pageHasCaptcha(page))) return true; // no captcha, nothing to do
-
-  logger.info({ pageUrl }, "reCAPTCHA detected — waiting for RektCaptcha extension to solve it");
-
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    await page.waitForTimeout(2000);
-    if (!(await pageHasCaptcha(page))) {
-      logger.info({ pageUrl }, "reCAPTCHA resolved by extension");
-      return true;
-    }
-    logger.debug({ pageUrl }, "Still waiting for extension to solve captcha...");
-  }
-
-  logger.warn({ pageUrl }, "Extension did not solve captcha within timeout — trying FastCaptcha fallback");
-
-  // FastCaptcha fallback: extract sitekey and get a token
-  if (!process.env["FASTCAPTCHA_API_KEY"]) return false;
-
-  let sitekey: string | null = null;
-  for (const f of page.frames()) {
+/** Check if a Frame has an active reCAPTCHA widget (checks frame + its child frames). */
+async function frameHasCaptcha(frame: import("playwright").Frame): Promise<boolean> {
+  try {
+    if (htmlHasActiveCaptcha(await frame.content())) return true;
+  } catch { /* ignore */ }
+  for (const f of frame.childFrames()) {
     try {
-      sitekey = await f.evaluate(() => {
-        const el = document.querySelector<HTMLElement>(".g-recaptcha[data-sitekey]") ??
-          document.querySelector<HTMLElement>("[data-sitekey]");
-        return el?.getAttribute("data-sitekey") ?? null;
-      });
-      if (sitekey) break;
+      if (htmlHasActiveCaptcha(await f.content())) return true;
     } catch { /* cross-origin */ }
   }
+  return false;
+}
 
-  if (!sitekey) return false;
-
-  try {
-    const token = await solveRecaptchaV2(pageUrl, sitekey);
-    await page.evaluate((t: string) => {
-      const el = document.getElementById("g-recaptcha-response") as HTMLTextAreaElement | null;
-      if (el) { el.style.display = "block"; el.value = t; }
-      document.querySelectorAll<HTMLTextAreaElement>("textarea[name='g-recaptcha-response']")
-        .forEach((e) => { e.value = t; });
-      const cbName = document.querySelector<HTMLElement>(".g-recaptcha[data-callback]")?.getAttribute("data-callback");
-      if (cbName && typeof (window as Record<string, unknown>)[cbName] === "function") {
-        (window as Record<string, unknown>)[cbName](t);
-      }
-      const gr = window as { ___grecaptcha_cfg?: { clients?: Record<string, { callback?: (t: string) => void }> } };
-      Object.values(gr.___grecaptcha_cfg?.clients ?? {}).forEach((c) => {
-        if (typeof c.callback === "function") c.callback(t);
-      });
-      const btn = document.querySelector<HTMLElement>("button[type='submit'], input[type='submit']");
-      if (btn) { btn.click(); return; }
-      document.querySelector<HTMLFormElement>("form")?.submit();
-    }, token);
-    logger.info({ pageUrl }, "FastCaptcha fallback: token injected");
-    await page.waitForTimeout(3000);
-    return !(await pageHasCaptcha(page));
-  } catch (err) {
-    logger.warn({ err: (err as Error).message }, "FastCaptcha fallback also failed");
-    return false;
+/**
+ * Let the loaded RektCaptcha extension auto-solve a reCAPTCHA on a full Page.
+ * Polls every 1.5 s until the widget disappears (max 45 s).
+ */
+async function waitForExtensionOnPage(
+  page: import("playwright").Page,
+  pageUrl: string,
+): Promise<void> {
+  if (!(await pageHasCaptcha(page))) return;
+  logger.info({ pageUrl }, "reCAPTCHA detected on page — waiting for RektCaptcha extension");
+  const deadline = Date.now() + 45_000;
+  while (Date.now() < deadline) {
+    await sleep(1500);
+    if (!(await pageHasCaptcha(page))) {
+      logger.info({ pageUrl }, "reCAPTCHA on page resolved by extension");
+      return;
+    }
+    logger.debug({ pageUrl }, "Extension still solving page captcha...");
   }
+  logger.warn({ pageUrl }, "Extension timed out solving page captcha");
+}
+
+/**
+ * Let the loaded RektCaptcha extension auto-solve a reCAPTCHA inside a Frame.
+ * Uses Frame-specific API — no broken Page cast.
+ */
+async function waitForExtensionOnFrame(
+  frame: import("playwright").Frame,
+  pageUrl: string,
+): Promise<void> {
+  if (!(await frameHasCaptcha(frame))) return;
+  logger.info({ pageUrl }, "reCAPTCHA detected in mail frame — waiting for RektCaptcha extension");
+  const deadline = Date.now() + 45_000;
+  while (Date.now() < deadline) {
+    await sleep(1500);
+    if (!(await frameHasCaptcha(frame))) {
+      logger.info({ pageUrl }, "reCAPTCHA in mail frame resolved by extension");
+      return;
+    }
+    logger.debug({ pageUrl }, "Extension still solving frame captcha...");
+  }
+  logger.warn({ pageUrl }, "Extension timed out solving frame captcha");
 }
 
 /**
@@ -595,14 +597,10 @@ async function fetchEmailWithBrowser(
         const mailFrame = await mailFrameHandle.contentFrame();
         if (mailFrame) {
           // Let RektCaptcha extension auto-solve; fallback to FastCaptcha if needed
-          await waitForExtensionToSolveCaptcha(mailFrame as unknown as import("playwright").Page, wmUrl);
+          await waitForExtensionOnFrame(mailFrame, wmUrl);
 
           const rawHtml = await mailFrame.content();
-          if (
-            rawHtml.includes("g-recaptcha") ||
-            rawHtml.includes("grecaptcha") ||
-            rawHtml.includes("recaptcha")
-          ) {
+          if (htmlHasActiveCaptcha(rawHtml)) {
             throw Object.assign(new Error("CAPTCHA_REQUIRED"), {
               code: "CAPTCHA_REQUIRED",
               yopmailUrl: wmUrl,
@@ -640,15 +638,11 @@ async function fetchEmailWithBrowser(
     });
 
     // Let RektCaptcha extension auto-solve; fallback to FastCaptcha if needed
-    await waitForExtensionToSolveCaptcha(page, wmUrl);
+    await waitForExtensionOnPage(page, wmUrl);
 
     const rawHtml = await page.content();
 
-    if (
-      rawHtml.includes("g-recaptcha") ||
-      rawHtml.includes("grecaptcha") ||
-      rawHtml.includes("recaptcha")
-    ) {
+    if (htmlHasActiveCaptcha(rawHtml)) {
       throw Object.assign(new Error("CAPTCHA_REQUIRED"), {
         code: "CAPTCHA_REQUIRED",
         yopmailUrl: wmUrl,
