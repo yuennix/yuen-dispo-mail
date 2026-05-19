@@ -24,6 +24,23 @@ function randomPrefix(len = 8) {
   ).join("");
 }
 
+const OTP_PATTERNS = [
+  /\b(\d{4,8})\b.*(?:code|pin|otp|verif|password|passcode)/i,
+  /(?:code|pin|otp|verif|password|passcode).*\b(\d{4,8})\b/i,
+  /\b(\d{4,8})\b.*(?:is your|are your)/i,
+  /(?:your|use)\b.*\b(\d{4,8})\b/i,
+  /^(\d{4,8})[\s\-–—]/,
+  /[\s\-–—](\d{4,8})$/,
+];
+
+function extractOtp(subject: string): string | null {
+  for (const pattern of OTP_PATTERNS) {
+    const match = subject.match(pattern);
+    if (match?.[1]) return match[1];
+  }
+  return null;
+}
+
 function isCaptchaError(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
   const data = (error as { data?: { error?: string } }).data;
