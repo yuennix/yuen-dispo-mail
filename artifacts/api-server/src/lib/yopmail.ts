@@ -52,8 +52,35 @@ interface YjCache {
   fetchedAt: number;
 }
 
+interface SessionCache {
+  session: Session;
+  cachedAt: number;
+}
+
 let yjCache: YjCache | null = null;
 const YJ_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+// Per-address session cache: key = "login@domain"
+const sessionCache = new Map<string, SessionCache>();
+const SESSION_CACHE_TTL_MS = 8 * 60 * 1000; // 8 minutes
+
+function getCachedSession(key: string): Session | null {
+  const entry = sessionCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.cachedAt > SESSION_CACHE_TTL_MS) {
+    sessionCache.delete(key);
+    return null;
+  }
+  return entry.session;
+}
+
+function setCachedSession(key: string, session: Session): void {
+  sessionCache.set(key, { session, cachedAt: Date.now() });
+}
+
+function invalidateCachedSession(key: string): void {
+  sessionCache.delete(key);
+}
 
 /**
  * Merge Set-Cookie headers from a response into an existing cookie string.
@@ -162,23 +189,26 @@ async function getSession(): Promise<Session> {
 }
 
 /**
- * Get a session that has visited the inbox, which causes Yopmail to set the
- * `yc` cookie needed for subsequent `/mail` requests to succeed.
+ * Build or reuse a warmed session for a given inbox.
+ * Visits the /inbox endpoint so Yopmail sets the cookies required by /mail.
+ * Persists the result in the session cache so subsequent calls reuse it.
  */
-async function getInboxWarmedSession(
+async function getOrCreateWarmedSession(
+  cacheKey: string,
   login: string,
   domain: string,
   isYopmail: boolean,
+  baseSession?: Session,
 ): Promise<Session> {
-  const session = await getSession();
+  const base = baseSession ?? (await getSession());
 
   const params: Record<string, string | number> = {
     login,
     p: 1,
     d: isYopmail ? "" : domain,
     ctrl: "",
-    yp: session.yp,
-    yj: session.yj,
+    yp: base.yp,
+    yj: base.yj,
     v: VER,
     "r_c": "",
     id: "",
@@ -189,7 +219,7 @@ async function getInboxWarmedSession(
     params,
     headers: {
       ...IFRAME_HEADERS,
-      Cookie: session.cookies,
+      Cookie: base.cookies,
       Referer: `${YOPMAIL_BASE}/`,
     },
     timeout: 15000,
@@ -198,10 +228,12 @@ async function getInboxWarmedSession(
   const setCookies: string[] = ([] as string[]).concat(
     resp.headers["set-cookie"] ?? [],
   );
-  const warmedCookies = mergeCookies(session.cookies, setCookies);
+  const warmedCookies = mergeCookies(base.cookies, setCookies);
+  const warmed: Session = { ...base, cookies: warmedCookies };
 
-  logger.debug("Inbox visited for cookie warm-up");
-  return { ...session, cookies: warmedCookies };
+  setCachedSession(cacheKey, warmed);
+  logger.debug({ cacheKey }, "Warmed session cached");
+  return warmed;
 }
 
 export async function fetchInbox(email: string): Promise<InboxResponse> {
@@ -210,9 +242,16 @@ export async function fetchInbox(email: string): Promise<InboxResponse> {
   const login = email.slice(0, atIndex).toLowerCase();
   const domain = email.slice(atIndex + 1).toLowerCase();
   const isYopmail = domain.includes("yopmail");
+  const cacheKey = `${login}@${domain}`;
 
-  const session = await getSession();
-  logger.debug({ login, domain }, "Fetching inbox");
+  // Reuse an existing warmed session if available; otherwise create one.
+  let session = getCachedSession(cacheKey);
+  if (!session) {
+    logger.debug({ login, domain }, "No cached session — warming a new one");
+    session = await getOrCreateWarmedSession(cacheKey, login, domain, isYopmail);
+  } else {
+    logger.debug({ login, domain }, "Reusing cached session for inbox");
+  }
 
   const params: Record<string, string | number> = {
     login,
@@ -236,6 +275,16 @@ export async function fetchInbox(email: string): Promise<InboxResponse> {
     },
     timeout: 15000,
   });
+
+  // Absorb any fresh cookies yopmail sends back and update the cache.
+  const freshCookies: string[] = ([] as string[]).concat(
+    resp.headers["set-cookie"] ?? [],
+  );
+  if (freshCookies.length > 0) {
+    const merged = mergeCookies(session.cookies, freshCookies);
+    const updated: Session = { ...session, cookies: merged };
+    setCachedSession(cacheKey, updated);
+  }
 
   const $ = cheerio.load(resp.data);
   const messages: InboxItem[] = [];
@@ -284,9 +333,17 @@ export async function fetchEmail(
   const login = email.slice(0, atIndex).toLowerCase();
   const domain = email.slice(atIndex + 1).toLowerCase();
   const isYopmail = domain.includes("yopmail");
+  const cacheKey = `${login}@${domain}`;
 
-  // Visit inbox first so Yopmail sets the `compte` and `ywm` cookies required by /mail
-  const session = await getInboxWarmedSession(login, domain, isYopmail);
+  // Reuse the warmed session from the inbox fetch if available; otherwise warm one now.
+  let session = getCachedSession(cacheKey);
+  if (!session) {
+    logger.debug({ login, domain }, "No cached session for email fetch — warming");
+    session = await getOrCreateWarmedSession(cacheKey, login, domain, isYopmail);
+  } else {
+    logger.debug({ login, domain }, "Reusing cached session for email fetch");
+  }
+
   logger.debug({ login, domain, id }, "Fetching email");
 
   // Yopmail's /mail endpoint expects id = "m" + elementId, where elementId is the
@@ -322,6 +379,8 @@ export async function fetchEmail(
     rawHtml.includes("grecaptcha") ||
     rawHtml.includes("recaptcha")
   ) {
+    // Invalidate the stale session so the next request gets a fresh one.
+    invalidateCachedSession(cacheKey);
     const yopmailUrl = `https://yopmail.com/en/wm?login=${login}${!isYopmail ? `&domain=${domain}` : ""}`;
     const err = new Error("CAPTCHA_REQUIRED") as Error & {
       code: string;
