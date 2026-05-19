@@ -123,7 +123,9 @@ export async function fetchInbox(email: string): Promise<InboxResponse> {
 
   $(".m").each((_i, el) => {
     const $el = $(el);
-    const id = $el.attr("id") || `msg_${_i}`;
+    // Element IDs are like "e_m1234567890" — strip "e_" to get the real message id "m1234567890"
+    const rawId = $el.attr("id") || "";
+    const id = rawId.replace(/^e_/, "") || `msg_${_i}`;
     const from =
       $el.find(".lmf").first().text().trim() ||
       $el.find(".lm .lmf").first().text().trim() ||
@@ -168,11 +170,10 @@ export async function fetchEmail(
   const session = await getSession();
   logger.debug({ login, domain, id }, "Fetching email");
 
-  const mailId = `m${id}`;
-
+  // id already has "m" prefix (e.g. "m1234567890") — use it directly
   const params: Record<string, string> = {
     b: login,
-    id: mailId,
+    id,
     yp: session.yp,
     yj: YJ,
     v: VER,
