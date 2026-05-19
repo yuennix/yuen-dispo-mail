@@ -375,7 +375,13 @@ async function fetchEmailViaDownload(
   const idCandidates = [`e_${id}`, id, `me_${id}`];
 
   for (const candidate of idCandidates) {
-    const params: Record<string, string> = { b: login, id: candidate };
+    const params: Record<string, string> = {
+      b: login,
+      id: candidate,
+      yp: session.yp,
+      yj: session.yj,
+      v: VER,
+    };
     if (!isYopmail) params.d = domain;
 
     logger.debug({ login, id: candidate }, "Downmail: trying id format");
