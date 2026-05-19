@@ -2,6 +2,12 @@ import { chromium, BrowserContext } from "playwright";
 import path from "path";
 import { logger } from "./logger";
 
+// Path to the unpacked RektCaptcha extension
+const EXTENSION_PATH = path.resolve(
+  process.cwd(),
+  "artifacts/api-server/.extensions/rektcaptcha",
+);
+
 const USER_DATA_DIR = path.join(process.cwd(), ".browser-data");
 
 let _context: BrowserContext | null = null;
@@ -170,7 +176,7 @@ export async function getBrowserContext(): Promise<BrowserContext> {
 
   _launching = chromium
     .launchPersistentContext(USER_DATA_DIR, {
-      headless: true,
+      headless: false,
       userAgent:
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
       viewport: { width: 1280, height: 800 },
@@ -184,9 +190,12 @@ export async function getBrowserContext(): Promise<BrowserContext> {
         "--disable-infobars",
         "--window-size=1280,800",
         "--start-maximized",
-        "--disable-extensions",
         "--no-first-run",
         "--disable-default-apps",
+        "--headless=new",
+        // Load RektCaptcha extension
+        `--load-extension=${EXTENSION_PATH}`,
+        `--disable-extensions-except=${EXTENSION_PATH}`,
       ],
       ignoreDefaultArgs: ["--enable-automation", "--enable-blink-features=IdleDetection"],
       extraHTTPHeaders: {

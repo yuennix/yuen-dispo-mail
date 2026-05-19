@@ -1,7 +1,6 @@
 import axios from "axios";
 import { logger } from "./logger";
 
-const FASTCAPTCHA_BASE = "https://fastcaptcha.org";
 const MAX_POLL_ATTEMPTS = 60;
 const POLL_INTERVAL_MS = 3000;
 
@@ -11,96 +10,77 @@ function getApiKey(): string {
   return key;
 }
 
-interface CreateTaskResponse {
-  errorId: number;
-  errorCode?: string;
-  errorDescription?: string;
-  taskId?: number;
-}
-
-interface TaskResultResponse {
-  errorId: number;
-  errorCode?: string;
-  errorDescription?: string;
-  status: "processing" | "ready";
-  solution?: {
-    gRecaptchaResponse?: string;
-    token?: string;
-  };
-}
-
 /**
- * Solve a reCAPTCHA v2 challenge using FastCaptcha.org.
+ * Solve a reCAPTCHA v2 using FastCaptcha (2captcha-compatible API format).
  * Returns the g-recaptcha-response token.
  */
 export async function solveRecaptchaV2(
   websiteURL: string,
   websiteKey: string,
 ): Promise<string> {
-  const clientKey = getApiKey();
+  const apiKey = getApiKey();
 
-  logger.info({ websiteURL, websiteKey }, "Submitting reCAPTCHA task to FastCaptcha");
+  logger.info({ websiteURL, websiteKey }, "Submitting reCAPTCHA to FastCaptcha (2captcha format)");
 
-  const createResp = await axios.post<CreateTaskResponse>(
-    `${FASTCAPTCHA_BASE}/createTask`,
+  // Step 1: submit the task
+  const submitParams = new URLSearchParams({
+    key: apiKey,
+    method: "userrecaptcha",
+    googlekey: websiteKey,
+    pageurl: websiteURL,
+    json: "1",
+  });
+
+  const submitResp = await axios.post<{ status: number; request: string }>(
+    "https://fastcaptcha.org/in.php",
+    submitParams.toString(),
     {
-      clientKey,
-      task: {
-        type: "RecaptchaV2TaskProxyless",
-        websiteURL,
-        websiteKey,
-      },
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      timeout: 15000,
     },
-    { timeout: 15000 },
   );
 
-  const createData = createResp.data;
+  const submitData = submitResp.data;
 
-  if (createData.errorId !== 0) {
-    throw new Error(
-      `FastCaptcha createTask error: ${createData.errorCode ?? "unknown"} — ${createData.errorDescription ?? ""}`,
-    );
+  if (submitData.status !== 1) {
+    throw new Error(`FastCaptcha submit error: ${submitData.request}`);
   }
 
-  const taskId = createData.taskId;
-  if (!taskId) {
-    throw new Error("FastCaptcha returned no taskId");
-  }
+  const taskId = submitData.request;
+  logger.info({ taskId }, "FastCaptcha task submitted, polling for result");
 
-  logger.info({ taskId }, "reCAPTCHA task created, polling for result");
-
+  // Step 2: poll for the result
   for (let attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt++) {
     await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
 
-    const resultResp = await axios.post<TaskResultResponse>(
-      `${FASTCAPTCHA_BASE}/getTaskResult`,
-      { clientKey, taskId },
-      { timeout: 15000 },
+    const resultResp = await axios.get<{ status: number; request: string }>(
+      "https://fastcaptcha.org/res.php",
+      {
+        params: {
+          key: apiKey,
+          action: "get",
+          id: taskId,
+          json: "1",
+        },
+        timeout: 15000,
+      },
     );
 
     const resultData = resultResp.data;
 
-    if (resultData.errorId !== 0) {
-      throw new Error(
-        `FastCaptcha getTaskResult error: ${resultData.errorCode ?? "unknown"} — ${resultData.errorDescription ?? ""}`,
-      );
+    if (resultData.request === "CAPCHA_NOT_READY") {
+      logger.debug({ taskId, attempt }, "FastCaptcha: still solving...");
+      continue;
     }
 
-    if (resultData.status === "ready") {
-      const token =
-        resultData.solution?.gRecaptchaResponse ??
-        resultData.solution?.token;
-
-      if (!token) {
-        throw new Error("FastCaptcha returned ready status but no token in solution");
-      }
-
-      logger.info({ taskId, attempt }, "reCAPTCHA solved by FastCaptcha");
-      return token;
+    if (resultData.status !== 1) {
+      throw new Error(`FastCaptcha result error: ${resultData.request}`);
     }
 
-    logger.debug({ taskId, attempt }, "reCAPTCHA still processing...");
+    const token = resultData.request;
+    logger.info({ taskId, attempt }, "FastCaptcha: reCAPTCHA solved");
+    return token;
   }
 
-  throw new Error(`FastCaptcha: timed out waiting for solution after ${MAX_POLL_ATTEMPTS} attempts`);
+  throw new Error(`FastCaptcha: timed out after ${MAX_POLL_ATTEMPTS} attempts`);
 }
