@@ -2,8 +2,7 @@ import axios from "axios";
 import * as cheerio from "cheerio";
 import { simpleParser } from "mailparser";
 import { logger } from "./logger";
-import { getBrowserContext } from "./browser";
-import { solveRecaptchaV2 } from "./captcha";
+import { getBrowserContext, solveCaptchaIfPresent } from "./browser";
 
 const YOPMAIL_BASE = "https://yopmail.com";
 const VER = "9.3";
@@ -477,75 +476,6 @@ function htmlHasActiveCaptcha(html: string): boolean {
   );
 }
 
-/** Check if a Page has an active reCAPTCHA widget (checks page + all child frames). */
-async function pageHasCaptcha(page: import("playwright").Page): Promise<boolean> {
-  try {
-    if (htmlHasActiveCaptcha(await page.content())) return true;
-  } catch { /* ignore */ }
-  for (const f of page.frames()) {
-    try {
-      if (htmlHasActiveCaptcha(await f.content())) return true;
-    } catch { /* cross-origin frame */ }
-  }
-  return false;
-}
-
-/** Check if a Frame has an active reCAPTCHA widget (checks frame + its child frames). */
-async function frameHasCaptcha(frame: import("playwright").Frame): Promise<boolean> {
-  try {
-    if (htmlHasActiveCaptcha(await frame.content())) return true;
-  } catch { /* ignore */ }
-  for (const f of frame.childFrames()) {
-    try {
-      if (htmlHasActiveCaptcha(await f.content())) return true;
-    } catch { /* cross-origin */ }
-  }
-  return false;
-}
-
-/**
- * Let the loaded RektCaptcha extension auto-solve a reCAPTCHA on a full Page.
- * Polls every 1.5 s until the widget disappears (max 45 s).
- */
-async function waitForExtensionOnPage(
-  page: import("playwright").Page,
-  pageUrl: string,
-): Promise<void> {
-  if (!(await pageHasCaptcha(page))) return;
-  logger.info({ pageUrl }, "reCAPTCHA detected on page — waiting for RektCaptcha extension");
-  const deadline = Date.now() + 45_000;
-  while (Date.now() < deadline) {
-    await sleep(1500);
-    if (!(await pageHasCaptcha(page))) {
-      logger.info({ pageUrl }, "reCAPTCHA on page resolved by extension");
-      return;
-    }
-    logger.debug({ pageUrl }, "Extension still solving page captcha...");
-  }
-  logger.warn({ pageUrl }, "Extension timed out solving page captcha");
-}
-
-/**
- * Let the loaded RektCaptcha extension auto-solve a reCAPTCHA inside a Frame.
- * Uses Frame-specific API — no broken Page cast.
- */
-async function waitForExtensionOnFrame(
-  frame: import("playwright").Frame,
-  pageUrl: string,
-): Promise<void> {
-  if (!(await frameHasCaptcha(frame))) return;
-  logger.info({ pageUrl }, "reCAPTCHA detected in mail frame — waiting for RektCaptcha extension");
-  const deadline = Date.now() + 45_000;
-  while (Date.now() < deadline) {
-    await sleep(1500);
-    if (!(await frameHasCaptcha(frame))) {
-      logger.info({ pageUrl }, "reCAPTCHA in mail frame resolved by extension");
-      return;
-    }
-    logger.debug({ pageUrl }, "Extension still solving frame captcha...");
-  }
-  logger.warn({ pageUrl }, "Extension timed out solving frame captcha");
-}
 
 /**
  * FALLBACK — headless browser that clicks the email row naturally.
@@ -596,9 +526,13 @@ async function fetchEmailWithBrowser(
       if (mailFrameHandle) {
         const mailFrame = await mailFrameHandle.contentFrame();
         if (mailFrame) {
-          // Let RektCaptcha extension auto-solve; fallback to FastCaptcha if needed
-          await waitForExtensionOnFrame(mailFrame, wmUrl);
-
+          const solved = await solveCaptchaIfPresent(mailFrame, `mail-frame:${login}@${domain}`);
+          if (!solved) {
+            throw Object.assign(new Error("CAPTCHA_REQUIRED"), {
+              code: "CAPTCHA_REQUIRED",
+              yopmailUrl: wmUrl,
+            });
+          }
           const rawHtml = await mailFrame.content();
           if (htmlHasActiveCaptcha(rawHtml)) {
             throw Object.assign(new Error("CAPTCHA_REQUIRED"), {
@@ -637,8 +571,13 @@ async function fetchEmailWithBrowser(
       timeout: 30000,
     });
 
-    // Let RektCaptcha extension auto-solve; fallback to FastCaptcha if needed
-    await waitForExtensionOnPage(page, wmUrl);
+    const solved = await solveCaptchaIfPresent(page, `/mail:${login}@${domain}`);
+    if (!solved) {
+      throw Object.assign(new Error("CAPTCHA_REQUIRED"), {
+        code: "CAPTCHA_REQUIRED",
+        yopmailUrl: wmUrl,
+      });
+    }
 
     const rawHtml = await page.content();
 
@@ -722,62 +661,15 @@ export async function fetchEmail(
 
   let rawHtml = resp.data as string;
 
-  // ── CAPTCHA detected in axios response — try to solve automatically ──────
+  // ── CAPTCHA detected in axios response ───────────────────────────────────
+  // The browser path (Step 2) already handles CAPTCHAs via the Buster extension.
+  // If we reach here and still see a CAPTCHA, there's nothing more to do.
   if (
     rawHtml.includes("g-recaptcha") ||
     rawHtml.includes("grecaptcha") ||
     rawHtml.includes("recaptcha")
   ) {
-    logger.info({ login, id }, "Axios /mail: CAPTCHA detected — attempting auto-solve");
-
-    const $ = cheerio.load(rawHtml);
-    const sitekey =
-      $(".g-recaptcha[data-sitekey]").attr("data-sitekey") ??
-      $("[data-sitekey]").attr("data-sitekey");
-
-    if (sitekey && process.env["FASTCAPTCHA_API_KEY"]) {
-      try {
-        const pageUrl = `${YOPMAIL_BASE}/en/wm?login=${login}${!isYopmail ? `&domain=${domain}` : ""}`;
-        const token = await solveRecaptchaV2(pageUrl, sitekey);
-
-        // Re-POST /mail with the captcha solution token
-        const postData = new URLSearchParams({
-          ...mailParams,
-          "g-recaptcha-response": token,
-        });
-
-        const retryResp = await axios.post(
-          `${YOPMAIL_BASE}/mail`,
-          postData.toString(),
-          {
-            headers: {
-              ...mailHeaders,
-              "Content-Type": "application/x-www-form-urlencoded",
-              Origin: YOPMAIL_BASE,
-            },
-            timeout: 20000,
-            maxRedirects: 5,
-          },
-        );
-
-        rawHtml = retryResp.data as string;
-
-        // If still showing captcha after solve attempt, fall through to error
-        if (
-          !rawHtml.includes("g-recaptcha") &&
-          !rawHtml.includes("grecaptcha") &&
-          !rawHtml.includes("recaptcha")
-        ) {
-          logger.info({ login, id }, "Axios /mail: CAPTCHA solved and email fetched");
-          return parseEmailHtml(rawHtml, id);
-        }
-
-        logger.warn({ login, id }, "Axios /mail: still seeing CAPTCHA after solve attempt");
-      } catch (captchaErr) {
-        logger.warn({ err: (captchaErr as Error).message }, "Axios /mail: CAPTCHA solve failed");
-      }
-    }
-
+    logger.warn({ login, id }, "Axios /mail: CAPTCHA detected in last-resort fallback");
     invalidateCachedSession(cacheKey);
     const yopmailUrl = `${YOPMAIL_BASE}/en/wm?login=${login}${!isYopmail ? `&domain=${domain}` : ""}`;
     throw Object.assign(new Error("CAPTCHA_REQUIRED"), {
